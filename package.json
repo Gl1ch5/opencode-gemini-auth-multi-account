@@ -1,10 +1,10 @@
 {
-  "name": "opencode-gemini-auth",
+  "name": "opencode-gemini-auth-multi-account",
   "main": "./index.ts",
   "module": "index.ts",
-  "version": "1.4.10",
-  "author": "jenslys",
-  "repository": "https://github.com/jenslys/opencode-gemini-auth",
+  "version": "1.4.11",
+  "author": "Gl1ch5",
+  "repository": "https://github.com/Gl1ch5/opencode-gemini-auth-multi-account",
   "files": [
     "index.ts",
     "src"
