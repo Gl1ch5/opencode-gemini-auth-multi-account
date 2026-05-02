@@ -1,6 +1,6 @@
 import { GEMINI_PROVIDER_ID } from "./constants";
 import { createOAuthAuthorizeMethod } from "./plugin/oauth-authorize";
-import { accessTokenExpired, isOAuthAuth } from "./plugin/auth";
+import { accessTokenExpired, getAvailableAccounts, isOAuthAuth, upsertAccount } from "./plugin/auth";
 import { resolveCachedAuth } from "./plugin/cache";
 import { ensureProjectContext, retrieveUserQuota } from "./plugin/project";
 import {
@@ -22,8 +22,10 @@ import {
   transformGeminiResponse,
 } from "./plugin/request";
 import { fetchWithRetry } from "./plugin/retry";
+import { classifyQuotaResponse } from "./plugin/retry/quota";
 import { refreshAccessToken } from "./plugin/token";
 import type {
+  AccountDetails,
   GetAuth,
   LoaderResult,
   OAuthAuthDetails,
@@ -98,22 +100,19 @@ export const GeminiCLIOAuthPlugin = async (
               return fetch(input, init);
             }
 
-            const latestAuth = await getAuth();
-            if (!isOAuthAuth(latestAuth)) {
+            const currentAuth = await getAuth();
+            if (!isOAuthAuth(currentAuth)) {
               return fetch(input, init);
             }
 
-            let authRecord = resolveCachedAuth(latestAuth);
-            if (accessTokenExpired(authRecord)) {
-              const refreshed = await refreshAccessToken(authRecord, client);
-              if (!refreshed) {
-                return fetch(input, init);
-              }
-              authRecord = refreshed;
-            }
-
-            if (!authRecord.access) {
-              return fetch(input, init);
+            const availableAccounts = getAvailableAccounts(currentAuth);
+            if (availableAccounts.length === 0) {
+               return new Response(JSON.stringify({
+                 error: {
+                   message: "All Gemini accounts are currently exhausted. Please wait or add another account.",
+                   status: "RESOURCE_EXHAUSTED"
+                 }
+               }), { status: 429, headers: { "Content-Type": "application/json" } });
             }
 
             const configuredProjectId = await resolveLatestConfiguredProjectId(provider);
@@ -122,52 +121,97 @@ export const GeminiCLIOAuthPlugin = async (
             if (requestUserAgentModel) {
               latestGeminiUserAgentModel = requestUserAgentModel;
             }
-            const projectContext = await ensureProjectContextOrThrow(
-              authRecord,
-              client,
-              configuredProjectId,
-              requestUserAgentModel,
-            );
-            await maybeShowGeminiTestToast(client, projectContext.effectiveProjectId);
-            await maybeLogAvailableQuotaModels(
-              authRecord.access,
-              projectContext.effectiveProjectId,
-              requestUserAgentModel,
-            );
-            const transformed = prepareGeminiRequest(
-              input,
-              init,
-              authRecord.access,
-              projectContext.effectiveProjectId,
-              thinkingConfigDefaults,
-            );
-            const debugContext = startGeminiDebugRequest({
-              originalUrl: toUrlString(input),
-              resolvedUrl: toUrlString(transformed.request),
-              method: transformed.init.method,
-              headers: transformed.init.headers,
-              body: transformed.init.body,
-              streaming: transformed.streaming,
-              projectId: projectContext.effectiveProjectId,
-            });
 
-            /**
-             * Retry transport/429 failures while preserving the requested model.
-             * We intentionally do not auto-downgrade model tiers to avoid misleading users.
-             */
-            const response = await fetchWithRetry(transformed.request, transformed.init);
-            await maybeShowGeminiCapacityToast(
-              client,
-              response,
-              projectContext.effectiveProjectId,
-              transformed.requestedModel,
-            );
-            return transformGeminiResponse(
-              response,
-              transformed.streaming,
-              debugContext,
-              transformed.requestedModel,
-            );
+            // Try accounts in order
+            for (let i = 0; i < availableAccounts.length; i++) {
+              const account = availableAccounts[i]!;
+              let authRecord: OAuthAuthDetails = {
+                type: "oauth",
+                refresh: account.refresh,
+                access: account.access,
+                expires: account.expires,
+                email: account.email,
+                accounts: currentAuth.accounts
+              };
+
+              if (accessTokenExpired(authRecord)) {
+                const refreshed = await refreshAccessToken(authRecord, client);
+                if (!refreshed) {
+                  continue; // Try next account
+                }
+                authRecord = refreshed;
+              }
+
+              if (!authRecord.access) {
+                continue;
+              }
+
+              const projectContext = await ensureProjectContextOrThrow(
+                authRecord,
+                client,
+                configuredProjectId,
+                requestUserAgentModel,
+              );
+
+              const transformed = prepareGeminiRequest(
+                input,
+                init,
+                authRecord.access,
+                projectContext.effectiveProjectId,
+                thinkingConfigDefaults,
+              );
+
+              const debugContext = startGeminiDebugRequest({
+                originalUrl: toUrlString(input),
+                resolvedUrl: toUrlString(transformed.request),
+                method: transformed.init.method,
+                headers: transformed.init.headers,
+                body: transformed.init.body,
+                streaming: transformed.streaming,
+                projectId: projectContext.effectiveProjectId,
+              });
+
+              const response = await fetchWithRetry(transformed.request, transformed.init);
+              
+              if (response.status === 429) {
+                const quota = await classifyQuotaResponse(response.clone());
+                if (quota?.terminal) {
+                  logGeminiDebugMessage(`Account ${account.email || account.refresh.slice(0, 10)} exhausted. Switching...`);
+                  
+                  // Mark as exhausted for 1 hour by default if no delay provided
+                  const exhaustedUntil = Date.now() + (quota.retryDelayMs ?? 3600_000);
+                  const updatedAuth = upsertAccount(currentAuth, {
+                    ...account,
+                    quotaExhaustedUntil: exhaustedUntil
+                  });
+
+                  await client.auth.set({
+                    path: { id: GEMINI_PROVIDER_ID },
+                    body: updatedAuth
+                  });
+
+                  if (i < availableAccounts.length - 1) {
+                    continue; // Loop to next account
+                  }
+                }
+              }
+
+              await maybeShowGeminiCapacityToast(
+                client,
+                response,
+                projectContext.effectiveProjectId,
+                transformed.requestedModel,
+              );
+
+              return transformGeminiResponse(
+                response,
+                transformed.streaming,
+                debugContext,
+                transformed.requestedModel,
+              );
+            }
+
+            return fetch(input, init); // Final fallback
           },
         };
       },
@@ -178,6 +222,16 @@ export const GeminiCLIOAuthPlugin = async (
           authorize: createOAuthAuthorizeMethod({
             getConfiguredProjectId: () => resolveLatestConfiguredProjectId(),
             getUserAgentModel: () => latestGeminiUserAgentModel,
+            getAuth: () => latestGeminiAuthResolver?.(),
+          }),
+        },
+        {
+          label: "Add another Google Account",
+          type: "oauth",
+          authorize: createOAuthAuthorizeMethod({
+            getConfiguredProjectId: () => resolveLatestConfiguredProjectId(),
+            getUserAgentModel: () => latestGeminiUserAgentModel,
+            getAuth: () => latestGeminiAuthResolver?.(),
           }),
         },
         {

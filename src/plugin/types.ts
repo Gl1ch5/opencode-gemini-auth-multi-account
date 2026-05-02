@@ -2,11 +2,21 @@ import type { GeminiTokenExchangeResult } from "../gemini/oauth";
 import type { Config } from "@opencode-ai/sdk";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 
+export interface AccountDetails {
+  refresh: string;
+  access?: string;
+  expires?: number;
+  email?: string;
+  quotaExhaustedUntil?: number;
+}
+
 export interface OAuthAuthDetails {
   type: "oauth";
   refresh: string;
   access?: string;
   expires?: number;
+  email?: string;
+  accounts?: AccountDetails[];
 }
 
 export interface NonOAuthAuthDetails {

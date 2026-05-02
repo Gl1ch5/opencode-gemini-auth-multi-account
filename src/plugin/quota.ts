@@ -23,7 +23,7 @@ export function createGeminiQuotaTool({
 }: GeminiQuotaToolDependencies) {
   return tool({
     description:
-      "Retrieve current Gemini Code Assist quota usage for the authenticated user and project.",
+      "Retrieve current Gemini Code Assist quota usage for all authenticated accounts.",
     args: {},
     async execute() {
       const getAuth = getAuthResolver();
@@ -36,47 +36,72 @@ export function createGeminiQuotaTool({
         return "Gemini quota requires OAuth with Google. Run `opencode auth login` and choose `OAuth with Google (Gemini CLI)`.";
       }
 
-      let authRecord = resolveCachedAuth(auth);
-      if (accessTokenExpired(authRecord)) {
-        const refreshed = await refreshAccessToken(authRecord, client);
-        if (!refreshed?.access) {
-          return "Gemini quota lookup failed because the access token could not be refreshed. Re-authenticate and retry.";
-        }
-        authRecord = refreshed;
-      }
+      const accounts = auth.accounts || [
+        {
+          refresh: auth.refresh,
+          access: auth.access,
+          expires: auth.expires,
+          email: auth.email,
+        },
+      ];
 
-      if (!authRecord.access) {
-        return "Gemini quota lookup failed because no access token is available. Re-authenticate and retry.";
-      }
+      const outputs: string[] = [];
+      for (const account of accounts) {
+        let authRecord: OAuthAuthDetails = {
+          type: "oauth",
+          ...account,
+          accounts: auth.accounts,
+        };
 
-      try {
-        const projectContext = await ensureProjectContext(
-          authRecord,
-          client,
-          getConfiguredProjectId(),
-          getUserAgentModel(),
-        );
-        if (!projectContext.effectiveProjectId) {
-          return "Gemini quota lookup failed because no Google Cloud project could be resolved.";
-        }
-
-        const quota = await retrieveUserQuota(
-          authRecord.access,
-          projectContext.effectiveProjectId,
-          getUserAgentModel(),
-        );
-        if (!quota?.buckets?.length) {
-          return `No Gemini quota buckets were returned for project \`${projectContext.effectiveProjectId}\`.`;
+        if (accessTokenExpired(authRecord)) {
+          const refreshed = await refreshAccessToken(authRecord, client);
+          if (refreshed?.access) {
+            authRecord = refreshed;
+          }
         }
 
-        return formatGeminiQuotaOutput(
-          projectContext.effectiveProjectId,
-          quota.buckets,
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "unknown error";
-        return `Gemini quota lookup failed: ${message}`;
+        if (!authRecord.access) {
+          outputs.push(`### Account: ${account.email || "Unknown"}\nQuota lookup failed: No access token available.`);
+          continue;
+        }
+
+        try {
+          const projectContext = await ensureProjectContext(
+            authRecord,
+            client,
+            getConfiguredProjectId(),
+            getUserAgentModel(),
+          );
+          if (!projectContext.effectiveProjectId) {
+            outputs.push(`### Account: ${account.email || "Unknown"}\nQuota lookup failed: No Google Cloud project could be resolved.`);
+            continue;
+          }
+
+          const quota = await retrieveUserQuota(
+            authRecord.access,
+            projectContext.effectiveProjectId,
+            getUserAgentModel(),
+          );
+
+          const header = `### Account: ${account.email || "Unknown"} (Project: ${projectContext.effectiveProjectId})`;
+          if (!quota?.buckets?.length) {
+            outputs.push(`${header}\nNo Gemini quota buckets were returned.`);
+            continue;
+          }
+
+          outputs.push(
+            `${header}\n\n${formatGeminiQuotaOutput(
+              projectContext.effectiveProjectId,
+              quota.buckets,
+            )}`,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "unknown error";
+          outputs.push(`### Account: ${account.email || "Unknown"}\nQuota lookup failed: ${message}`);
+        }
       }
+
+      return outputs.join("\n\n" + "=".repeat(40) + "\n\n");
     },
   });
 }

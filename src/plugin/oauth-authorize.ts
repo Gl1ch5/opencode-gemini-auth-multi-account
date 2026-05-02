@@ -6,7 +6,8 @@ import { isGeminiDebugEnabled, logGeminiDebugMessage } from "./debug";
 import { resolveProjectContextFromAccessToken } from "./project";
 import { resolveConfiguredProjectId } from "./provider";
 import { startOAuthListener, type OAuthListener } from "./server";
-import type { OAuthAuthDetails } from "./types";
+import { isOAuthAuth, upsertAccount } from "./auth";
+import type { AuthDetails, OAuthAuthDetails } from "./types";
 
 /**
  * Builds the OAuth authorize callback used by plugin auth methods.
@@ -14,6 +15,7 @@ import type { OAuthAuthDetails } from "./types";
 export function createOAuthAuthorizeMethod(options?: {
   getConfiguredProjectId?: () => Promise<string | undefined> | string | undefined;
   getUserAgentModel?: () => Promise<string | undefined> | string | undefined;
+  getAuth?: () => Promise<AuthDetails>;
 }): () => Promise<{
   url: string;
   instructions: string;
@@ -38,6 +40,7 @@ export function createOAuthAuthorizeMethod(options?: {
           refresh: result.refresh,
           access: result.access,
           expires: result.expires,
+          email: result.email,
         } satisfies OAuthAuthDetails;
         const projectContext = await resolveProjectContextFromAccessToken(
           authSnapshot,
@@ -52,9 +55,21 @@ export function createOAuthAuthorizeMethod(options?: {
             `OAuth project resolved during auth: ${projectContext.effectiveProjectId || "none"}`,
           );
         }
-        return projectContext.auth.refresh !== result.refresh
-          ? { ...result, refresh: projectContext.auth.refresh }
-          : result;
+
+        const latestRefresh = projectContext.auth.refresh || result.refresh;
+        const currentAuth = await options?.getAuth?.();
+        const mergedAuth = upsertAccount(isOAuthAuth(currentAuth) ? currentAuth : undefined, {
+          refresh: latestRefresh,
+          access: result.access,
+          expires: result.expires,
+          email: result.email,
+        });
+
+        return {
+          ...result,
+          refresh: mergedAuth.refresh,
+          accounts: mergedAuth.accounts,
+        };
       } catch (error) {
         if (isGeminiDebugEnabled()) {
           const message = error instanceof Error ? error.message : String(error);

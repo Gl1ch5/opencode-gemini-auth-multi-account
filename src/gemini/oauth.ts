@@ -33,6 +33,7 @@ interface GeminiTokenExchangeSuccess {
   access: string;
   expires: number;
   email?: string;
+  accounts?: any[];
 }
 
 interface GeminiTokenExchangeFailure {
